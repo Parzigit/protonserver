@@ -1,12 +1,13 @@
-
-from fastapi import FastAPI, UploadFile,File,BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from redis import Redis
 from rq import Queue
-import uuid,shutil,os
+import uuid, shutil, os
 from worker import process_pdf
-app=FastAPI()
+from qa import answer_question 
+
+app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,8 +15,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-redis_conn=Redis()
-task_queue=Queue('pdf-tasks', connection=redis_conn)
+redis_conn = Redis()
+task_queue = Queue('pdf-tasks', connection=redis_conn)
+
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
     file_id = str(uuid.uuid4())
@@ -25,10 +27,14 @@ async def upload_pdf(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, buffer)
     job = task_queue.enqueue(process_pdf, path, file_id) 
     return {"job_id": file_id}
+
 @app.get("/ask")
-def ask_question(job_id: str, question: str):
-    from qa import answer_question
-    return {"answer": answer_question(job_id, question)}
+async def ask_question(job_id: str, question: str):
+    try:
+        answer = answer_question(job_id, question) 
+        return {"answer": answer}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) 
 @app.get("/pdf/{job_id}")
 def serve_pdf(job_id: str):
     return FileResponse(f"./uploads/{job_id}.pdf", media_type='application/pdf')
