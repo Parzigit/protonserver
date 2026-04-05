@@ -1,0 +1,15 @@
+{
+    "builds": [
+      {
+        "src": "main.py",
+        "use": "@railway/python",
+        "name": "Web Service"
+      },
+      {
+        "src": "worker.py",
+        "use": "@railway/python",
+        "name": "RQ Worker"
+      }
+    ]
+  }
+  
