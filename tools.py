@@ -1,6 +1,7 @@
 from fastapi import APIRouter, File, UploadFile, Form, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 import fitz
+import pikepdf
 import io
 import zipfile
 import traceback
@@ -68,75 +69,136 @@ async def split_pdf(file: UploadFile = File(...), ranges: str = Form(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _compress_to_target(content: bytes, target_pct: int):
+    """
+    Compress PDF to as close to target_pct% size reduction as possible.
+    1. Render every page to a pixmap once at a chosen DPI.
+    2. Binary-search JPEG quality (5-92) over ~10 fast iterations to hit
+       target_size = original_size * (1 - target_pct/100).
+    3. Apply pikepdf structural compression on top.
+    Returns (best_bytes, image_count).
+    """
+    original_size = len(content)
+    target_size   = max(1, int(original_size * (1 - target_pct / 100)))
+
+    if target_pct <= 25:
+        dpi = 140
+    elif target_pct <= 50:
+        dpi = 110
+    elif target_pct <= 70:
+        dpi = 85
+    else:
+        dpi = 60
+
+    src = fitz.open(stream=content, filetype="pdf")
+    rendered_pages = []
+    for page in src:
+        mat = fitz.Matrix(dpi / 72, dpi / 72)
+        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, alpha=False)
+        rendered_pages.append((pix, page.rect.width, page.rect.height))
+    src.close()
+
+    def _build(quality: int) -> bytes:
+        out = fitz.open()
+        for pix, pw, ph in rendered_pages:
+            img_bytes = pix.tobytes("jpeg", jpg_quality=quality)
+            new_page  = out.new_page(width=pw, height=ph)
+            new_page.insert_image(fitz.Rect(0, 0, pw, ph), stream=img_bytes)
+        try:
+            result = out.tobytes(garbage=4, deflate=True,
+                                 deflate_images=True, deflate_fonts=True)
+        except TypeError:
+            result = out.tobytes(garbage=4, deflate=True)
+        out.close()
+        return result
+
+    lo, hi = 5, 92
+    best_bytes = None
+    best_diff  = float("inf")
+    for _ in range(10):
+        mid = (lo + hi) // 2
+        candidate = _build(mid)
+        diff = abs(len(candidate) - target_size)
+        if diff < best_diff:
+            best_diff  = diff
+            best_bytes = candidate
+        if lo >= hi:
+            break
+        if len(candidate) > target_size:
+            hi = mid - 1
+        else:
+            lo = mid + 1
+
+    try:
+        pike_buf = io.BytesIO()
+        with pikepdf.Pdf.open(io.BytesIO(best_bytes)) as pdf:
+            pdf.save(pike_buf,
+                     compress_streams=True,
+                     object_stream_mode=pikepdf.ObjectStreamMode.generate,
+                     recompress_flate=True,
+                     preserve_pdfa=False)
+        pike_bytes = pike_buf.getvalue()
+        if len(pike_bytes) < len(best_bytes):
+            best_bytes = pike_bytes
+    except Exception:
+        pass
+
+    return best_bytes, 0
+
+
 # ─── 3. Compress PDF ───────────────────────────────────────────────────────
 @router.post("/compress")
 async def compress_pdf(
     file: UploadFile = File(...),
-    level: str = Form("medium"),  # low, medium, high, extreme
+    target_pct: int = Form(40),
 ):
     try:
         content = await file.read()
         original_size = len(content)
-        doc = fitz.open(stream=content, filetype="pdf")
-
-        if level == "extreme":
-            # Downsample all images to very low quality
-            for page in doc:
-                il = page.get_images(full=True)
-                for img in il:
-                    xref = img[0]
-                    try:
-                        base = doc.extract_image(xref)
-                        if base and base["width"] > 150:
-                            img_data = base["image"]
-                            pix = fitz.Pixmap(img_data)
-                            # Shrink to 25%
-                            factor = 0.25
-                            new_pix = fitz.Pixmap(pix, int(pix.width * factor), int(pix.height * factor))
-                            page.replace_image(xref, pixmap=new_pix)
-                    except Exception:
-                        continue
-
-            out_bytes = doc.tobytes(garbage=4, deflate=True, clean=True)
-
-        elif level == "high":
-            for page in doc:
-                il = page.get_images(full=True)
-                for img in il:
-                    xref = img[0]
-                    try:
-                        base = doc.extract_image(xref)
-                        if base and base["width"] > 300:
-                            img_data = base["image"]
-                            pix = fitz.Pixmap(img_data)
-                            factor = 0.5
-                            new_pix = fitz.Pixmap(pix, int(pix.width * factor), int(pix.height * factor))
-                            page.replace_image(xref, pixmap=new_pix)
-                    except Exception:
-                        continue
-            out_bytes = doc.tobytes(garbage=4, deflate=True, clean=True)
-
-        elif level == "medium":
-            out_bytes = doc.tobytes(garbage=4, deflate=True, clean=True)
-
-        else:  # low
-            out_bytes = doc.tobytes(garbage=3, deflate=True)
-
-        doc.close()
-        compressed_size = len(out_bytes)
-        reduction = round((1 - compressed_size / original_size) * 100, 1) if original_size > 0 else 0
-
+        best_bytes, image_count = _compress_to_target(content, target_pct)
+        compressed_size  = len(best_bytes)
+        actual_reduction = max(0.0, round((1 - compressed_size / original_size) * 100, 1))
+        saved_bytes      = max(0, original_size - compressed_size)
         return StreamingResponse(
-            io.BytesIO(out_bytes),
+            io.BytesIO(best_bytes),
             media_type="application/pdf",
             headers={
                 "Content-Disposition": 'attachment; filename="compressed.pdf"',
-                "X-Original-Size": str(original_size),
+                "X-Original-Size":   str(original_size),
                 "X-Compressed-Size": str(compressed_size),
-                "X-Reduction": str(reduction),
-                "Access-Control-Expose-Headers": "X-Original-Size, X-Compressed-Size, X-Reduction",
+                "X-Reduction":       str(actual_reduction),
+                "X-Saved-Bytes":     str(saved_bytes),
+                "X-Image-Count":     str(image_count),
+                "Access-Control-Expose-Headers":
+                    "X-Original-Size, X-Compressed-Size, X-Reduction, X-Saved-Bytes, X-Image-Count",
             }
         )
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── 3b. Compress Preview ────────────────────────────────────────────────────
+@router.post("/compress-preview")
+async def compress_preview(
+    file: UploadFile = File(...),
+    target_pct: int = Form(40),
+):
+    """Run the compression pipeline and return size stats as JSON (no download)."""
+    try:
+        content = await file.read()
+        original_size = len(content)
+        best_bytes, image_count = _compress_to_target(content, target_pct)
+        compressed_size = len(best_bytes)
+        reduction       = max(0.0, round((1 - compressed_size / original_size) * 100, 1))
+        saved_bytes     = max(0, original_size - compressed_size)
+        return JSONResponse({
+            "original_size":   original_size,
+            "compressed_size": compressed_size,
+            "reduction":       reduction,
+            "saved_bytes":     saved_bytes,
+            "image_count":     image_count,
+        })
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
